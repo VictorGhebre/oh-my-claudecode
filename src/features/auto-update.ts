@@ -10,16 +10,41 @@
  * - Configurable update notifications
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
-import { homedir, tmpdir } from 'os';
-import { execSync } from 'child_process';
+import { homedir } from 'os';
+import { execFileSync } from 'child_process';
 
 /** GitHub repository information */
 export const REPO_OWNER = 'Yeachan-Heo';
 export const REPO_NAME = 'oh-my-claudecode';
 export const GITHUB_API_URL = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}`;
 export const GITHUB_RAW_URL = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}`;
+export const NPM_PACKAGE_NAME = 'oh-my-claudecode';
+
+const RELEASE_VERSION_PATTERN =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+/**
+ * Convert a GitHub release tag into a safe, exact npm version.
+ *
+ * Release metadata is remote input. Accepting only a complete semantic version
+ * prevents npm package-spec injection and guarantees updates never use a
+ * mutable dist-tag such as `latest`.
+ */
+export function normalizeReleaseVersion(tag: string): string {
+  const version = tag.startsWith('v') ? tag.slice(1) : tag;
+
+  if (!RELEASE_VERSION_PATTERN.test(version)) {
+    throw new Error(`Invalid release version: ${JSON.stringify(tag)}`);
+  }
+
+  return version;
+}
+
+function getNpmExecutable(): string {
+  return process.platform === 'win32' ? 'npm.cmd' : 'npm';
+}
 
 /** Installation paths */
 export const CLAUDE_CONFIG_DIR = join(homedir(), '.claude');
@@ -127,15 +152,16 @@ export function getInstalledVersion(): VersionMetadata | null {
     // Try to detect version from package.json if installed via npm
     try {
       // Check if we can find the package in node_modules
-      const result = execSync('npm list -g oh-my-claudecode --json', {
+      const result = execFileSync(getNpmExecutable(), ['list', '--global', NPM_PACKAGE_NAME, '--json'], {
         encoding: 'utf-8',
         timeout: 5000,
-        stdio: 'pipe'
+        stdio: 'pipe',
+        windowsHide: true
       });
       const data = JSON.parse(result);
-      if (data.dependencies?.['oh-my-claudecode']?.version) {
+      if (data.dependencies?.[NPM_PACKAGE_NAME]?.version) {
         return {
-          version: data.dependencies['oh-my-claudecode'].version,
+          version: data.dependencies[NPM_PACKAGE_NAME].version,
           installedAt: new Date().toISOString(),
           installMethod: 'npm'
         };
@@ -252,7 +278,7 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
   const release = await fetchLatestRelease();
 
   const currentVersion = installed?.version ?? null;
-  const latestVersion = release.tag_name.replace(/^v/, '');
+  const latestVersion = normalizeReleaseVersion(release.tag_name);
 
   const updateAvailable = currentVersion === null || compareVersions(currentVersion, latestVersion) < 0;
 
@@ -269,7 +295,7 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
 }
 
 /**
- * Download and execute the install script to perform an update
+ * Install an exact published npm release to perform an update
  */
 export async function performUpdate(options?: {
   skipConfirmation?: boolean;
@@ -281,96 +307,39 @@ export async function performUpdate(options?: {
   try {
     // Fetch the latest release to get the version
     const release = await fetchLatestRelease();
-    const newVersion = release.tag_name.replace(/^v/, '');
+    const newVersion = normalizeReleaseVersion(release.tag_name);
+    const packageSpec = `${NPM_PACKAGE_NAME}@${newVersion}`;
 
-    // Download the install script
-    const installScriptUrl = `${GITHUB_RAW_URL}/main/scripts/install.sh`;
-    const response = await fetch(installScriptUrl);
-
-    if (!response.ok) {
-      throw new Error(`Failed to download install script: ${response.status}`);
-    }
-
-    const scriptContent = await response.text();
-
-    // Save to a temporary file
-    const tempDir = tmpdir();
-    const tempScript = join(tempDir, `omc-update-${Date.now()}.sh`);
-
-    writeFileSync(tempScript, scriptContent, { mode: 0o755 });
-
-    // Execute the install script (platform-aware)
+    // Pass every argument separately so remote release metadata can never be
+    // interpreted by a command shell. The exact version avoids mutable tags.
     try {
-      const isWindows = process.platform === 'win32';
-
-      if (isWindows) {
-        // Use npm for Windows updates instead of bash script
-        try {
-          execSync('npm install -g oh-my-claudecode@latest', {
-            encoding: 'utf-8',
-            stdio: options?.verbose ? 'inherit' : 'pipe',
-            timeout: 120000, // 2 minute timeout for npm
-            windowsHide: true
-          });
-
-          // Update version metadata for npm install
-          saveVersionMetadata({
-            version: newVersion,
-            installedAt: new Date().toISOString(),
-            installMethod: 'npm',
-            lastCheckAt: new Date().toISOString()
-          });
-
-          return {
-            success: true,
-            previousVersion,
-            newVersion,
-            message: `Successfully updated from ${previousVersion ?? 'unknown'} to ${newVersion} via npm`
-          };
-        } catch (npmError) {
-          throw new Error(
-            'Auto-update via npm failed. Please run manually:\n' +
-            '  npm install -g oh-my-claudecode@latest\n' +
-            `Error: ${npmError instanceof Error ? npmError.message : npmError}`
-          );
-        }
-      }
-
-      execSync(`bash "${tempScript}"`, {
+      execFileSync(getNpmExecutable(), ['install', '--global', packageSpec], {
         encoding: 'utf-8',
         stdio: options?.verbose ? 'inherit' : 'pipe',
-        timeout: 60000 // 1 minute timeout
+        timeout: 120000,
+        windowsHide: true
       });
 
       // Update version metadata
       saveVersionMetadata({
         version: newVersion,
         installedAt: new Date().toISOString(),
-        installMethod: 'script',
+        installMethod: 'npm',
         lastCheckAt: new Date().toISOString()
       });
-
-      // Clean up temp file
-      try {
-        unlinkSync(tempScript);
-      } catch {
-        // Ignore cleanup errors
-      }
 
       return {
         success: true,
         previousVersion,
         newVersion,
-        message: `Successfully updated from ${previousVersion ?? 'unknown'} to ${newVersion}`
+        message: `Successfully updated from ${previousVersion ?? 'unknown'} to ${newVersion} via npm`
       };
-    } catch (error) {
-      // Clean up temp file on error too
-      try {
-        unlinkSync(tempScript);
-      } catch {
-        // Ignore cleanup errors
-      }
-      throw error;
+    } catch (npmError) {
+      throw new Error(
+        'Auto-update via npm failed. Please run manually:\n' +
+        `  npm install --global ${packageSpec}\n` +
+        `Error: ${npmError instanceof Error ? npmError.message : npmError}`
+      );
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -401,7 +370,7 @@ export function formatUpdateNotification(checkResult: UpdateCheckResult): string
     `  Latest version:  ${checkResult.latestVersion}`,
     '',
     '  To update, run: /update',
-    '  Or run: curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/oh-my-claudecode/main/scripts/install.sh | bash',
+    `  Or run: npm install --global ${NPM_PACKAGE_NAME}@${checkResult.latestVersion}`,
     ''
   ];
 
